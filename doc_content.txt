@@ -1,0 +1,424 @@
+Roommate Agreement Generator ΓÇô Design & Architecture (Azure + Python)
+Scope: MVP that ships in weeks, scales to low fiveΓÇæfigure MAUs, handles PII/ID images securely, supports Solana crypto ($2) and card ($2.50), DocuSign eΓÇæsign, and automated reminders.
+
+1) Goals & NonΓÇæGoals
+Goals (MVP) - Create, route, and eΓÇæsign roommate agreements endΓÇætoΓÇæend. - Collect payment before generating the final, signable document. - Verify initiator and roommate identities (ID upload + optional ID.me verification). - Store all PII and ID images securely with least privilege. - Notify on important lifecycle events (invite, signed, expiring soon). - Ship with spoonΓÇæfed infrastructure-as-clicks (Azure Portal) and IaC code next.
+NonΓÇæGoals (MVP) - Full legal review for every locale (we provide clear disclaimers). - Background checks / score computation engine (placeholder hooks only). - Native mobile apps (responsive web only).
+
+2) HighΓÇæLevel Architecture (AzureΓÇæfirst)
+Frontend: React (Next.js or plain React) static app hosted via Azure Static Web Apps (optional) or served by backend.
+Backend: Python FastAPI on Azure App Service (Linux), - Background jobs on Azure Functions (timer/queue triggered) for: DocuSign status polling, reminder emails/SMS, monthly incentive drawing (see legal note).
+Data: - Azure Database for PostgreSQL ΓÇô Flexible Server (relational core).
+- Azure Blob Storage: agreements, drafts, signed PDFs, and ID images (in a separate container).
+- Azure Key Vault: secrets (DocuSign, Solana, Stripe/Coinbase Commerce/Helius, ID.me, ACS, database creds, CMK for Storage SSE).
+- Azure Service Bus: decouple events (payment_succeeded, envelope_completed, reminder_due).
+Identity & Access:
+- Azure AD B2C for email/phone signΓÇæup/signΓÇæin (OTP or passwordless).
+- ID.me (or Onfido/Persona) optional KYC; store only verification result + minimal metadata; ID images stored in Blob (encrypted) if you must retain.
+Payments:
+- Solana: Solana Pay (USDC on Solana) or Coinbase Commerce (supports USDC/SOL; simplest hosted checkout) for $2 crypto price point.
+- Card: Stripe Checkout for $2.50.
+EΓÇæSignature:
+- DocuSign eSignature: envelopes, embedded signing links, Connect webhooks for completed status.
+Notifications:
+- Azure Communication Services (ACS): email/SMS invites, reminders.
+Observability & Security:
+- Azure Application Insights (metrics/logs/traces), Defender for Cloud, private endpoints for DB/Storage, Key Vault Managed HSM or CMK.
+ASCII Diagram
+[User Browser]
+   |  HTTPS (B2C)
+   v
+[Azure Static Web Apps or Frontend] --(JWT)--> [FastAPI on App Service]
+                                               |        |           |
+                                           [Postgres] [ServiceBus] [KeyVault]
+                                               |          |           |
+                                           [Blob Storage]<---> [Functions]
+                                               |               (poll & notify)
+                       (webhooks)              |
+[SolanaPay/Coinbase] -----> [FastAPI Webhooks] |
+[Stripe Checkout]     -----> [FastAPI Webhooks] |
+[DocuSign Connect]    -----> [FastAPI Webhooks] v
+                                            [ACS Email/SMS]
+
+3) User Roles & Workflow
+Roles - Initiator (lease holder) - Roommate (invitee) - Admin (support only; no document editing)
+Workflow (Roommate Agreement) 1. Create Account (AAD B2C: email/phone) ΓåÆ optional ID.me Verify. 2. Initiate Agreement: upload lease first page + govt ID (front/back), fill structured form (address, rent shares, utilities, chores, quiet hours, guest rules, pets, deposit, forfeiture reasons, local ΓÇ£no offensive clauseΓÇ¥ ack, additional rules). 3. Pay: $2 crypto (Solana/USDC) or $2.50 card (Stripe). If unpaid, draft is locked from signing. 4. Generate DocuSign Envelope (server builds PDF from template + variables, adds recipient routing: roommates ΓåÆ initiator final signer). 5. Invite Roommates (email/SMS via ACS). Roommates create account + upload ID. 6. Sign: each roommate signs via DocuSign embedded link ΓåÆ status callback (webhook) ΓåÆ DB updated. 7. Final Sign by Initiator (once all roommates signed). 8. Archive: final signed PDF stored to Blob, immutable policy (optional, using Blob versioning + legal hold if needed). Everyone can view/download from their portal. 9. Expiry Reminder: 30 days before end date, send reminders (ACS) and upsell renewal. 10. Monthly Incentive (sweepstakes/lottery): gated behind legal rules (see ┬º14).
+
+4) Data Model (PostgreSQL)
+-- users
+create table app_user (
+  id uuid primary key default gen_random_uuid(),
+  b2c_sub text unique not null,
+  email citext not null,
+  phone text,
+  is_verified bool default false,
+  created_at timestamptz default now()
+);
+
+-- ID verification (only store minimal)
+create table id_verification (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references app_user(id),
+  provider text check (provider in ('idme','onfido','persona')),
+  status text check (status in ('pending','approved','rejected')),
+  reference_id text,
+  completed_at timestamptz,
+  created_at timestamptz default now()
+);
+
+-- files (Blob pointers)
+create table file_asset (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid references app_user(id),
+  kind text check (kind in ('lease_first_page','govt_id','agreement_pdf','signed_pdf')),
+  container text not null,
+  blob_name text not null,
+  sha256 bytea,
+  size_bytes bigint,
+  created_at timestamptz default now()
+);
+
+-- agreements
+create table agreement (
+  id uuid primary key default gen_random_uuid(),
+  initiator_id uuid references app_user(id),
+  title text default 'Roommate Agreement',
+  address_line1 text,
+  address_line2 text,
+  city text, state text, postal_code text, country text,
+  start_date date, end_date date,
+  rent_total_cents integer not null,
+  status text check (status in ('draft','awaiting_payment','inviting','signing','completed','void')) default 'awaiting_payment',
+  created_at timestamptz default now()
+);
+
+-- roommates (participants)
+create table agreement_party (
+  id uuid primary key default gen_random_uuid(),
+  agreement_id uuid references agreement(id) on delete cascade,
+  user_id uuid references app_user(id),
+  role text check (role in ('initiator','roommate')),
+  email citext not null,
+  phone text,
+  rent_share_cents integer,
+  utilities jsonb,  -- {"electricity":50, "internet":50,...}
+  chores jsonb,
+  signed bool default false,
+  signed_at timestamptz
+);
+
+-- terms
+create table agreement_terms (
+  agreement_id uuid primary key references agreement(id) on delete cascade,
+  quiet_hours jsonb,  -- {"start":"22:00","end":"07:00"}
+  guest_rules jsonb,  -- {"max_consecutive_nights":3, "notice_hours":24}
+  pet_rules jsonb,    -- {"allowed":true, "notes":"small dog"}
+  deposit_cents integer,
+  deposit_forfeit_reasons text[],
+  additional_rules text,
+  no_offensive_clause_ack bool
+);
+
+-- payments
+create table payment (
+  id uuid primary key default gen_random_uuid(),
+  agreement_id uuid references agreement(id) on delete cascade,
+  method text check (method in ('solana','card')),
+  amount_cents integer not null,
+  currency text default 'USD',
+  status text check (status in ('pending','succeeded','failed','refunded')),
+  provider_ref text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- signatures / DocuSign
+create table signature_envelope (
+  id uuid primary key default gen_random_uuid(),
+  agreement_id uuid references agreement(id) on delete cascade,
+  docusign_envelope_id text,
+  status text, -- sent, completed, voided
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- notifications & audit
+create table notification (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references app_user(id),
+  channel text check (channel in ('email','sms')),
+  template text,
+  payload jsonb,
+  sent_at timestamptz
+);
+
+create table audit_log (
+  id uuid primary key default gen_random_uuid(),
+  actor_user_id uuid,
+  action text,
+  target text,
+  meta jsonb,
+  created_at timestamptz default now()
+);
+
+5) API Design (FastAPI)
+Auth: Azure AD B2C issues JWT ΓåÆ FastAPI validates with JWKS.
+Routes (MVP)
+POST   /api/agreements            # create draft (awaiting_payment)
+POST   /api/agreements/{id}/pay   # init payment (solana|stripe)
+POST   /api/webhooks/stripe       # stripe events
+POST   /api/webhooks/coinbase     # crypto events (if Coinbase Commerce)
+POST   /api/webhooks/solana       # optional custom webhook validator
+POST   /api/agreements/{id}/invite
+POST   /api/agreements/{id}/docusign/envelope
+GET    /api/agreements/{id}/signlink   # embedded link per user
+POST   /api/webhooks/docusign      # connect callbacks
+GET    /api/agreements/{id}
+GET    /api/agreements             # list my agreements
+GET    /api/files/{file_id}/sas    # shortΓÇælived SAS for viewing
+POST   /api/upload-sas             # create SAS for client directΓÇætoΓÇæblob
+Service Bus Topics - payment.succeeded ΓåÆ create DocuSign envelope - envelope.completed ΓåÆ archive signed PDF + notify all - agreement.expiring ΓåÆ email/SMS reminders
+
+6) Code Skeletons (Python)
+6.1 FastAPI app structure
+app/
+  main.py
+  deps/auth.py
+  routers/agreements.py
+  routers/webhooks.py
+  services/payments.py
+  services/docusign.py
+  services/storage.py
+  services/notify.py
+  services/kyc.py
+  models.py (SQLAlchemy)
+  db.py
+6.2 main.py
+from fastapi import FastAPI
+from routers import agreements, webhooks
+from deps.auth import auth_dependency
+
+app = FastAPI(title="Roommate Agreements")
+
+app.include_router(agreements.router, prefix="/api", dependencies=[auth_dependency])
+app.include_router(webhooks.router, prefix="/api/webhooks")
+
+@app.get("/healthz")
+def health():
+    return {"ok": True}
+6.3 Upload flow (SAS) ΓÇô storage.py
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from datetime import datetime, timedelta
+import os
+
+bsc = BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CS"])
+CONTAINER_ID = "agreements"
+ID_CONTAINER = "ids"
+
+def get_put_sas(blob_name: str, container: str = CONTAINER_ID):
+    key = os.environ["AZURE_STORAGE_ACCOUNT_KEY"]
+    token = generate_blob_sas(
+        account_name=bsc.account_name,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=key,
+        permission=BlobSasPermissions(write=True, create=True),
+        expiry=datetime.utcnow() + timedelta(minutes=15)
+    )
+    url = f"https://{bsc.account_name}.blob.core.windows.net/{container}/{blob_name}?{token}"
+    return {"url": url}
+6.4 Payment init (Stripe + Coinbase Commerce)
+import stripe, os, requests
+
+stripe.api_key = os.environ["STRIPE_SK"]
+COINBASE_API = "https://api.commerce.coinbase.com/charges"
+
+def start_card_checkout(agreement_id: str):
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{"price_data": {"currency": "usd","product_data": {"name": "Roommate Agreement"},"unit_amount": 250},"quantity": 1}],
+        success_url=f"https://app.example.com/agreements/{agreement_id}?paid=1",
+        cancel_url=f"https://app.example.com/agreements/{agreement_id}?canceled=1",
+        metadata={"agreement_id": agreement_id}
+    )
+    return {"url": session.url}
+
+def start_crypto_checkout(agreement_id: str):
+    headers = {"X-CC-Api-Key": os.environ["COINBASE_COMMERCE_KEY"], "Content-Type": "application/json"}
+    payload = {
+      "name": "Roommate Agreement",
+      "pricing_type": "fixed_price",
+      "local_price": {"amount": "2.00", "currency": "USD"},
+      "metadata": {"agreement_id": agreement_id},
+      "redirect_url": f"https://app.example.com/agreements/{agreement_id}?paid=1",
+      "cancel_url": f"https://app.example.com/agreements/{agreement_id}?canceled=1"
+    }
+    r = requests.post(COINBASE_API, headers=headers, json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()["data"]["hosted_url"]
+6.5 DocuSign envelope create (simplified)
+from docusign_esign import ApiClient, EnvelopesApi, EnvelopeDefinition, Document, Signer, SignHere, Tabs, Recipients
+import base64, os
+
+def create_envelope(agreement_pdf_bytes: bytes, recipients: list[dict]):
+    api_client = ApiClient()
+    api_client.host = os.environ["DOCUSIGN_BASE_URL"]
+    api_client.set_default_header("Authorization", f"Bearer {os.environ['DOCUSIGN_ACCESS_TOKEN']}")
+
+    doc_b64 = base64.b64encode(agreement_pdf_bytes).decode()
+    document = Document(document_base64=doc_b64, name="Roommate Agreement", file_extension="pdf", document_id="1")
+
+    signers = []
+    for i, r in enumerate(recipients, start=1):
+        signers.append(Signer(email=r["email"], name=r["name"], recipient_id=str(i), routing_order=str(i)))
+
+    tabs = Tabs(sign_here_tabs=[SignHere(document_id="1", page_number="1", x_position="100", y_position="150")])
+    for s in signers: s.tabs = tabs
+
+    envelope_definition = EnvelopeDefinition(
+        email_subject="Please sign your roommate agreement",
+        documents=[document],
+        recipients=Recipients(signers=signers),
+        status="sent"
+    )
+
+    envelopes_api = EnvelopesApi(api_client)
+    results = envelopes_api.create_envelope(account_id=os.environ['DOCUSIGN_ACCOUNT_ID'], envelope_definition=envelope_definition)
+    return results.envelope_id
+6.6 Reminder job (Azure Functions - Python)
+# Timer trigger every day at 09:00 UTC
+# Check agreements expiring in 30 days; send ACS email
+
+7) Document Generation
+Use Jinja2 ΓåÆ HTML template ΓåÆ WeasyPrint (or wkhtmltopdf) to render PDF prior to DocuSign.
+Keep a versioned template file per locale/jurisdiction; store template id in agreement.
+Template Variables - Parties (names, emails), property address, rent split, utilities matrix, chores, quiet hours, guests, pets, deposit, forfeiture reasons, effective/term dates, governing law, severability, legal disclaimer.
+
+8) Security & Privacy
+PII/ID Storage: Store ID images in dedicated container with private endpoint only, CMK via Key Vault, Blob versioning off (or legal hold policies if required). Access via userΓÇædelegation SAS short TTLs; backend issues SAS per request after verifying JWT.
+Secrets in Key Vault only; use managed identity for App Service/Functions for Key Vault and Storage.
+Network: Private endpoints for Postgres/Storage; VNet integration for App Service/Functions.
+Data Minimization: For ID verification, persist only provider status, reference_id, and completed_atΓÇönot raw PIIΓÇöunless retention is required.
+Audit Logging for all access to ID container and signed PDFs.
+Compliance: Display ToS/Privacy, CCPA/GDPR rights (export/delete), age gate, and Jurisdictional disclaimer (not a law firm). DPA with processors (Stripe, Coinbase Commerce, DocuSign, ID provider).
+
+9) Azure Provisioning (ClickΓÇæOps first)
+Resource Group: rg-roommate-prod (region close to users).
+
+Postgres Flexible Server: pg-roommate (Burstable B2ms, 2 vCores, 50GB). Configure private DNS + private endpoint.
+Storage Account: stroommate (Blob, hierarchical namespace off). Containers: agreements, ids, signed. Enable soft delete for agreements only.
+Key Vault: kv-roommate with RBAC; import CMK for Storage SSE.
+Service Bus: sb-roommate with topics payment, envelope, reminders.
+App Service (Linux): app-roommate with Managed Identity, VNet integration.
+Azure Functions (Python): func-roommate (Consumption), Managed Identity, VNet integration.
+Azure AD B2C tenant: user flows for signΓÇæup/in with email + phone.
+ACS: set verified domain for email; SMS sender IDs.
+Application Insights: connect App Service + Functions.
+Later provide Terraform/Bicep. For now: create, then record resource IDs into Key Vault secrets (or App Config).
+
+10) Local Dev Setup
+python -m venv .venv && source .venv/bin/activate
+pip install fastapi uvicorn[standard] python-dotenv SQLAlchemy psycopg[binary] azure-storage-blob docusign-esign stripe requests pydantic jinja2 weasyprint
+export AZURE_STORAGE_CS=... STRIPE_SK=... DOCUSIGN_ACCESS_TOKEN=... DOCUSIGN_ACCOUNT_ID=...
+uvicorn app.main:app --reload
+
+11) Frontend UX (MVP forms)
+Wizard:
+Identity & ID upload 2) Property & dates 3) Rent & utilities 4) Rules (chores, quiet hours, guests, pets) 5) Deposit & forfeiture 6) Legal acks 7) Review 8) Pay 9) Invite 10) Track signatures.
+PostΓÇæpay lock form (no edits) ΓåÆ edits require starting a new version.
+Status badges: Awaiting Payment, Invites Sent, Signing, Completed.
+
+12) Background Jobs (Functions)
+DocuSign Poller: Fallback if Connect webhooks fail; reconcile statuses ΓåÆ publish envelope.completed.
+Reminder Scheduler: Daily cron to find expiring agreements in 30 days ΓåÆ ACS send.
+Incentive Draw: Monthly cron; export eligible users ΓåÆ pick random ΓåÆ notify (see ┬º14).
+
+13) Pricing & Cost Notes (ballpark)
+App Service (B1): ~$55/mo; Functions (consumption): low.
+Postgres B2ms + 50GB: ~$70ΓÇô120/mo.
+
+Storage: pennies + egress; put signed PDFs in Cool tier.
+Service Bus Basic: ~$10/mo.
+
+ACS email: $1ΓÇô2/10k emails; SMS varies by country.
+
+DocuSign: perΓÇæenvelope plan (budget).
+
+Stripe: 2.9% + $0.30; Coinbase Commerce: ~1%.
+MVP infra target: <$300/mo before usageΓÇæbased items (DocuSign + emails + checkout fees).
+
+14) Legal & Compliance Flags (Read First)
+Disclaimer: ΓÇ£We are not a law firm. This service provides generic templates. For legal advice, consult an attorney.ΓÇ¥
+Jurisdiction: Provide a governingΓÇælaw dropΓÇædown; tailor some clauses (e.g., eviction or security deposit handling) per state/country; maintain change log.
+Retention: Clearly state how long ID images are kept (recommend minimal; purge after verification unless required).
+Sweepstakes: If running a ΓÇ£monthly lucky winnerΓÇ¥ paying one monthΓÇÖs rent:
+Treat as a sweepstakes (no skill). Many jurisdictions require ΓÇ£no purchase necessaryΓÇ¥, published rules, odds, eligibility, value caps, and tax handling (1099ΓÇæMISC in US). Consult counsel; MVP: disable until reviewed.
+
+15) Future Roadmap
+Background checks integration (Checkr/Trulioo) with explicit consent.
+Reputation/score computation (privacyΓÇæpreserving: only ratings, no defamatory content; Right to Appeal/Delete).
+BillΓÇæsplit and chore tracking (Stripe Billing for subscriptions; calendar reminders).
+MultiΓÇædoc catalog (NDA, Rental, Employer, General Biz) with multiΓÇælocale templates and pricing.
+
+16) Testing Strategy
+Unit tests for: payment signature verification, SAS token issuance, DocuSign payload parser, PDF template rendering.
+Integration tests in CI: Spin ephemeral Postgres with test data; mock webhooks.
+Security tests: brokenΓÇæobjectΓÇælevel authorization (BOLA) checks, SAS misuse, blob ACLs.
+
+17) CI/CD (GitHub Actions ΓÇô sketch)
+Build & test ΓåÆ OIDC to Azure ΓåÆ deploy container to App Service ΓåÆ run alembic migrations.
+Functions packaged & deployed with func azure functionapp publish.
+
+18) SpoonΓÇæFed Implementation Steps
+Create Azure AD B2C tenant; make user flow (email+phone). Record tenant ID, client ID.
+Provision Azure resources from ┬º9.
+Create Storage containers: agreements, ids, signed.
+Create Postgres DB, run the schema from ┬º4.
+Create Key Vault secrets: STRIPE_SK, COINBASE_COMMERCE_KEY, DOCUSIGN_ACCESS_TOKEN, DOCUSIGN_ACCOUNT_ID, AZURE_STORAGE_ACCOUNT_KEY, DB conn string.
+Deploy FastAPI container to App Service; set managed identity & Key Vault references.
+Point Frontend to /api and use B2C token for Authorization header.
+Enable Webhooks: Stripe/Coinbase/DocuSign to /api/webhooks/* (public endpoint). Validate signatures.
+Test E2E: create agreement ΓåÆ pay (test mode) ΓåÆ send invites ΓåÆ sign (DocuSign demo account) ΓåÆ verify final PDF in Blob.
+Enable cron Functions for reminders; verify ACS email/SMS sending.
+
+19) Risk Register
+KYC & ID storage risk ΓåÆ mitigate via minimal retention + encryption + private endpoints.
+Jurisdictional enforceability ΓåÆ advisor review per region.
+Payments dispute/chargeback ΓåÆ keep server logs + signed PDFs.
+Sweepstakes compliance ΓåÆ delay until legal review.
+
+20) Appendix: Example FastAPI Endpoints
+# routers/agreements.py
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from services import payments, docusign, storage
+
+router = APIRouter()
+
+class AgreementCreate(BaseModel):
+    address_line1: str
+    city: str
+    state: str
+    postal_code: str
+    start_date: str
+    end_date: str
+    rent_total_cents: int
+    terms: dict
+
+@router.post("/agreements")
+def create_agreement(body: AgreementCreate, user=Depends(...)):
+    # insert into DB (omitted)
+    # return payment links
+    return {
+      "agreement_id": "...",
+      "pay": {
+        "card": payments.start_card_checkout("..."),
+        "crypto": payments.start_crypto_checkout("...")
+      }
+    }
+
+@router.post("/agreements/{id}/invite")
+def invite_roommates(id: str, user=Depends(...)):
+    # verify payment status, generate SAS for roommate ID upload, send ACS emails
+    return {"ok": True}
+
