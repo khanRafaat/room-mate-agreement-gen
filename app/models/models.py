@@ -3,7 +3,8 @@ Roommate Agreement Generator - SQLAlchemy Models
 Compatible with MySQL database
 """
 import uuid
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from typing import Optional, List
 from sqlalchemy import (
     Column, String, Text, Boolean, Integer, BigInteger,
@@ -18,15 +19,21 @@ def generate_uuid():
     return str(uuid.uuid4())
 
 
+def generate_invite_token():
+    return secrets.token_urlsafe(32)
+
+
 class AppUser(Base):
-    """User accounts linked to Azure AD B2C."""
+    """User accounts with local authentication."""
     __tablename__ = "app_user"
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
     b2c_sub = Column(String(255), unique=True, nullable=False, index=True)
-    email = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=True)  # For local auth
+    name = Column(String(255), nullable=True)  # Display name
     phone = Column(String(50), nullable=True)
-    is_verified = Column(Boolean, default=False)
+    is_verified = Column(Boolean, default=False)  # ID.me verification status
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -34,6 +41,8 @@ class AppUser(Base):
     file_assets = relationship("FileAsset", back_populates="owner")
     agreements = relationship("Agreement", back_populates="initiator")
     notifications = relationship("Notification", back_populates="user")
+    feedback_given = relationship("Feedback", foreign_keys="Feedback.from_user_id", back_populates="from_user")
+    feedback_received = relationship("Feedback", foreign_keys="Feedback.to_user_id", back_populates="to_user")
 
 
 class IdVerification(Base):
@@ -85,7 +94,7 @@ class Agreement(Base):
     start_date = Column(Date, nullable=True)
     end_date = Column(Date, nullable=True)
     rent_total_cents = Column(Integer, nullable=False)
-    status = Column(String(50), default="draft")  # 'draft', 'awaiting_payment', 'inviting', 'signing', 'completed', 'void'
+    status = Column(String(50), default="draft")  # 'draft', 'awaiting_payment', 'paid', 'inviting', 'signing', 'completed', 'void'
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -94,6 +103,8 @@ class Agreement(Base):
     terms = relationship("AgreementTerms", back_populates="agreement", uselist=False, cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="agreement", cascade="all, delete-orphan")
     envelopes = relationship("SignatureEnvelope", back_populates="agreement", cascade="all, delete-orphan")
+    invite_tokens = relationship("InviteToken", back_populates="agreement", cascade="all, delete-orphan")
+    feedback = relationship("Feedback", back_populates="agreement", cascade="all, delete-orphan")
 
 
 class AgreementParty(Base):
@@ -164,6 +175,44 @@ class SignatureEnvelope(Base):
     
     # Relationships
     agreement = relationship("Agreement", back_populates="envelopes")
+
+
+class InviteToken(Base):
+    """Secure invite tokens for roommate invitations."""
+    __tablename__ = "invite_token"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agreement_id = Column(String(36), ForeignKey("agreement.id", ondelete="CASCADE"), nullable=False)
+    email = Column(String(255), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, default=generate_invite_token, index=True)
+    is_used = Column(Boolean, default=False)
+    used_by_user_id = Column(String(36), ForeignKey("app_user.id"), nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    agreement = relationship("Agreement", back_populates="invite_tokens")
+
+
+class Feedback(Base):
+    """Roommate feedback and ratings."""
+    __tablename__ = "feedback"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    agreement_id = Column(String(36), ForeignKey("agreement.id", ondelete="CASCADE"), nullable=False)
+    from_user_id = Column(String(36), ForeignKey("app_user.id"), nullable=False)
+    to_user_id = Column(String(36), ForeignKey("app_user.id"), nullable=False)
+    rating = Column(Integer, nullable=False)  # 1-5 stars
+    comment = Column(Text, nullable=True)
+    categories = Column(JSON, nullable=True)  # {"cleanliness": 4, "communication": 5, "respect": 4}
+    is_anonymous = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    agreement = relationship("Agreement", back_populates="feedback")
+    from_user = relationship("AppUser", foreign_keys=[from_user_id], back_populates="feedback_given")
+    to_user = relationship("AppUser", foreign_keys=[to_user_id], back_populates="feedback_received")
 
 
 class Notification(Base):

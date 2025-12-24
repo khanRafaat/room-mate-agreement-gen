@@ -1,22 +1,24 @@
 """
 Roommate Agreement Generator - Agreements Router
-API endpoints for agreement management
+API endpoints for agreement management with verification enforcement
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
 from uuid import UUID
+from datetime import datetime, timedelta
 
 from app.database import get_db
-from app.deps.auth import get_current_user, TokenData
+from app.deps.auth import get_current_user, CurrentUser
 from app.models.models import (
-    AppUser, Agreement, AgreementParty, AgreementTerms, Payment
+    AppUser, Agreement, AgreementParty, AgreementTerms, Payment, InviteToken
 )
 from app.schemas.agreement import (
     AgreementCreate, AgreementResponse, AgreementListResponse,
     AgreementUpdate, InviteRequest, AgreementPartyResponse
 )
 from app.schemas.payment import CheckoutLinks, CheckoutResponse
+from app.schemas.feedback import InviteTokenResponse
 from app.services.payments import payments_service
 from app.services.notify import notification_service
 from app.services.docusign import docusign_service
@@ -26,30 +28,32 @@ router = APIRouter(prefix="/agreements", tags=["agreements"])
 settings = get_settings()
 
 
-def get_or_create_user(db: Session, token: TokenData) -> AppUser:
-    """Get existing user or create a new one from token data."""
-    user = db.query(AppUser).filter(AppUser.b2c_sub == token.sub).first()
-    if not user:
-        user = AppUser(
-            b2c_sub=token.sub,
-            email=token.email or f"{token.sub}@placeholder.com",
+def require_verified_user(user: AppUser):
+    """Check that user is ID verified, raise exception if not."""
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must complete ID verification (ID.me) before creating or viewing agreements"
         )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return user
 
 
 @router.post("", response_model=AgreementResponse, status_code=status.HTTP_201_CREATED)
 async def create_agreement(
     body: AgreementCreate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
-    Create a new roommate agreement (draft status, awaiting payment).
+    Create a new roommate agreement (draft status).
+    
+    **Requires**: User must be ID verified via ID.me
+    
+    Agreement starts as 'draft' and moves to 'awaiting_payment' when ready.
     """
-    user = get_or_create_user(db, current_user)
+    user = current_user.user
+    
+    # Enforce ID verification
+    require_verified_user(user)
     
     # Create agreement
     agreement = Agreement(
@@ -64,7 +68,7 @@ async def create_agreement(
         start_date=body.start_date,
         end_date=body.end_date,
         rent_total_cents=body.rent_total_cents,
-        status="awaiting_payment"
+        status="draft"  # Start as draft, not awaiting_payment
     )
     db.add(agreement)
     db.flush()
@@ -93,7 +97,7 @@ async def create_agreement(
         )
         db.add(terms)
     
-    # Add roommate parties if provided
+    # Add roommate parties if provided (as placeholders)
     if body.parties:
         for party_data in body.parties:
             party = AgreementParty(
@@ -116,12 +120,12 @@ async def create_agreement(
 @router.get("", response_model=List[AgreementListResponse])
 async def list_agreements(
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     List all agreements for the current user.
     """
-    user = get_or_create_user(db, current_user)
+    user = current_user.user
     
     # Get agreements where user is initiator or a party
     agreements = db.query(Agreement).filter(
@@ -136,14 +140,19 @@ async def list_agreements(
 async def get_agreement(
     agreement_id: UUID,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Get a specific agreement by ID.
-    """
-    user = get_or_create_user(db, current_user)
     
-    agreement = db.query(Agreement).filter(Agreement.id == agreement_id).first()
+    **Requires**: User must be ID verified to view agreement details.
+    """
+    user = current_user.user
+    
+    # Enforce ID verification for viewing
+    require_verified_user(user)
+    
+    agreement = db.query(Agreement).filter(Agreement.id == str(agreement_id)).first()
     
     if not agreement:
         raise HTTPException(
@@ -167,15 +176,16 @@ async def update_agreement(
     agreement_id: UUID,
     body: AgreementUpdate,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
-    Update an agreement (only allowed in draft/awaiting_payment status).
+    Update an agreement (only allowed in draft status).
     """
-    user = get_or_create_user(db, current_user)
+    user = current_user.user
+    require_verified_user(user)
     
     agreement = db.query(Agreement).filter(
-        Agreement.id == agreement_id,
+        Agreement.id == str(agreement_id),
         Agreement.initiator_id == user.id
     ).first()
     
@@ -185,7 +195,7 @@ async def update_agreement(
             detail="Agreement not found"
         )
     
-    if agreement.status not in ["draft", "awaiting_payment"]:
+    if agreement.status not in ["draft"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot update agreement after payment"
@@ -202,19 +212,22 @@ async def update_agreement(
     return agreement
 
 
-@router.post("/{agreement_id}/pay", response_model=CheckoutLinks)
-async def initiate_payment(
+@router.post("/{agreement_id}/finalize", response_model=dict)
+async def finalize_draft(
     agreement_id: UUID,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
-    Get payment checkout links (card and crypto options).
+    Finalize a draft agreement and move it to awaiting_payment status.
+    
+    This step is required before payment.
     """
-    user = get_or_create_user(db, current_user)
+    user = current_user.user
+    require_verified_user(user)
     
     agreement = db.query(Agreement).filter(
-        Agreement.id == agreement_id,
+        Agreement.id == str(agreement_id),
         Agreement.initiator_id == user.id
     ).first()
     
@@ -224,10 +237,48 @@ async def initiate_payment(
             detail="Agreement not found"
         )
     
-    if agreement.status not in ["draft", "awaiting_payment"]:
+    if agreement.status != "draft":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Agreement already paid or in signing process"
+            detail="Agreement is not in draft status"
+        )
+    
+    # Move to awaiting_payment
+    agreement.status = "awaiting_payment"
+    db.commit()
+    
+    return {"ok": True, "status": "awaiting_payment", "message": "Agreement finalized. Please complete payment."}
+
+
+@router.post("/{agreement_id}/pay", response_model=CheckoutLinks)
+async def initiate_payment(
+    agreement_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Get payment checkout links (card and crypto options).
+    
+    Only available after agreement is finalized (awaiting_payment status).
+    """
+    user = current_user.user
+    require_verified_user(user)
+    
+    agreement = db.query(Agreement).filter(
+        Agreement.id == str(agreement_id),
+        Agreement.initiator_id == user.id
+    ).first()
+    
+    if not agreement:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agreement not found"
+        )
+    
+    if agreement.status != "awaiting_payment":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Agreement must be finalized before payment"
         )
     
     agreement_id_str = str(agreement.id)
@@ -285,20 +336,25 @@ async def initiate_payment(
     return CheckoutLinks(card=card_checkout, crypto=crypto_checkout)
 
 
-@router.post("/{agreement_id}/invite", response_model=dict)
+@router.post("/{agreement_id}/invite", response_model=List[InviteTokenResponse])
 async def invite_roommates(
     agreement_id: UUID,
     body: InviteRequest,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
-    Invite roommates to the agreement (requires payment first).
+    Invite roommates to the agreement via email.
+    
+    **Requires**: Agreement must be paid (status = 'paid')
+    
+    Generates unique invite tokens and sends email invitations.
     """
-    user = get_or_create_user(db, current_user)
+    user = current_user.user
+    require_verified_user(user)
     
     agreement = db.query(Agreement).filter(
-        Agreement.id == agreement_id,
+        Agreement.id == str(agreement_id),
         Agreement.initiator_id == user.id
     ).first()
     
@@ -308,73 +364,119 @@ async def invite_roommates(
             detail="Agreement not found"
         )
     
-    # Check payment status
-    successful_payment = db.query(Payment).filter(
-        Payment.agreement_id == agreement.id,
-        Payment.status == "succeeded"
-    ).first()
-    
-    if not successful_payment and agreement.status == "awaiting_payment":
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Payment required before inviting roommates"
-        )
-    
-    # Add roommates and send invites
-    invited_count = 0
-    for roommate in body.roommates:
-        # Check if already a party
-        existing = db.query(AgreementParty).filter(
-            AgreementParty.agreement_id == agreement.id,
-            AgreementParty.email == roommate.email
+    # Check payment status - must be paid
+    if agreement.status not in ["paid", "inviting"]:
+        successful_payment = db.query(Payment).filter(
+            Payment.agreement_id == agreement.id,
+            Payment.status == "succeeded"
         ).first()
         
-        if not existing:
-            party = AgreementParty(
-                agreement_id=agreement.id,
-                role="roommate",
-                email=roommate.email,
-                phone=roommate.phone,
-                rent_share_cents=roommate.rent_share_cents,
-                utilities=roommate.utilities,
-                chores=roommate.chores
+        if not successful_payment:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="Payment required before inviting roommates"
             )
-            db.add(party)
+        
+        # Update status to paid
+        agreement.status = "paid"
+    
+    # Generate invites
+    invite_responses = []
+    expires_at = datetime.utcnow() + timedelta(days=7)
+    
+    for roommate in body.roommates:
+        # Check if already a party with user_id
+        existing_party = db.query(AgreementParty).filter(
+            AgreementParty.agreement_id == agreement.id,
+            AgreementParty.email == roommate.email,
+            AgreementParty.user_id != None
+        ).first()
+        
+        if existing_party:
+            continue  # Already joined
+        
+        # Check for existing unused invite
+        existing_invite = db.query(InviteToken).filter(
+            InviteToken.agreement_id == agreement.id,
+            InviteToken.email == roommate.email,
+            InviteToken.is_used == False
+        ).first()
+        
+        if existing_invite:
+            # Update expiry
+            existing_invite.expires_at = expires_at
+            invite_token = existing_invite
+        else:
+            # Create party placeholder if not exists
+            party = db.query(AgreementParty).filter(
+                AgreementParty.agreement_id == agreement.id,
+                AgreementParty.email == roommate.email
+            ).first()
             
-            # Send invite email
-            try:
-                invite_link = f"{settings.frontend_url}/agreements/{agreement.id}/join"
-                notification_service.send_invite_email(
-                    to_email=roommate.email,
-                    inviter_name=user.email,
-                    agreement_title=agreement.title,
-                    invite_link=invite_link
+            if not party:
+                party = AgreementParty(
+                    agreement_id=agreement.id,
+                    role="roommate",
+                    email=roommate.email,
+                    phone=roommate.phone,
+                    rent_share_cents=roommate.rent_share_cents,
+                    utilities=roommate.utilities,
+                    chores=roommate.chores
                 )
-            except Exception:
-                pass  # Email not configured
+                db.add(party)
             
-            invited_count += 1
+            # Create invite token
+            invite_token = InviteToken(
+                agreement_id=agreement.id,
+                email=roommate.email,
+                expires_at=expires_at
+            )
+            db.add(invite_token)
+            db.flush()
+        
+        invite_url = f"{settings.frontend_url}/invites/accept/{invite_token.token}"
+        
+        # Send invite email
+        try:
+            notification_service.send_invite_email(
+                to_email=roommate.email,
+                inviter_name=user.name or user.email,
+                agreement_title=agreement.title,
+                invite_link=invite_url
+            )
+        except Exception:
+            pass  # Email not configured
+        
+        invite_responses.append(InviteTokenResponse(
+            token=invite_token.token,
+            email=invite_token.email,
+            expires_at=invite_token.expires_at,
+            invite_url=invite_url
+        ))
     
     # Update agreement status
     agreement.status = "inviting"
     db.commit()
     
-    return {"ok": True, "invited_count": invited_count}
+    return invite_responses
 
 
 @router.post("/{agreement_id}/docusign/envelope", response_model=dict)
 async def create_docusign_envelope(
     agreement_id: UUID,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Create a DocuSign envelope for the agreement.
+    
+    All parties must have joined before creating the envelope.
     """
-    user = get_or_create_user(db, current_user)
+    user = current_user.user
+    require_verified_user(user)
     
     agreement = db.query(Agreement).filter(
-        Agreement.id == agreement_id,
+        Agreement.id == str(agreement_id),
         Agreement.initiator_id == user.id
     ).first()
     
@@ -390,13 +492,25 @@ async def create_docusign_envelope(
             detail="Agreement not ready for signing"
         )
     
-    # TODO: Generate PDF from template
-    # For now, return a placeholder response
+    # Check all parties have joined (have user_id)
+    unjoined = [p for p in agreement.parties if p.user_id is None]
+    if unjoined:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Waiting for {len(unjoined)} roommate(s) to join before signing"
+        )
+    
+    # Update status
+    agreement.status = "signing"
+    db.commit()
+    
+    # TODO: Generate PDF and create DocuSign envelope
     
     return {
         "ok": True,
-        "message": "DocuSign envelope creation requires PDF template generation",
-        "agreement_id": str(agreement.id)
+        "message": "Agreement ready for signing. DocuSign envelope creation requires PDF template.",
+        "agreement_id": str(agreement.id),
+        "status": "signing"
     }
 
 
@@ -404,14 +518,17 @@ async def create_docusign_envelope(
 async def get_signing_link(
     agreement_id: UUID,
     db: Session = Depends(get_db),
-    current_user: TokenData = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Get embedded signing link for the current user.
-    """
-    user = get_or_create_user(db, current_user)
     
-    agreement = db.query(Agreement).filter(Agreement.id == agreement_id).first()
+    User must be a verified party of the agreement.
+    """
+    user = current_user.user
+    require_verified_user(user)
+    
+    agreement = db.query(Agreement).filter(Agreement.id == str(agreement_id)).first()
     
     if not agreement:
         raise HTTPException(
@@ -421,7 +538,7 @@ async def get_signing_link(
     
     # Check user is a party
     party = next(
-        (p for p in agreement.parties if p.user_id == user.id or p.email == user.email),
+        (p for p in agreement.parties if p.user_id == user.id),
         None
     )
     
@@ -444,3 +561,41 @@ async def get_signing_link(
         "message": "Signing link requires active DocuSign envelope",
         "agreement_id": str(agreement.id)
     }
+
+
+@router.post("/{agreement_id}/complete", response_model=dict)
+async def complete_agreement(
+    agreement_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Mark agreement as completed (all signatures received).
+    
+    In production, this would be triggered by DocuSign webhook.
+    """
+    user = current_user.user
+    
+    agreement = db.query(Agreement).filter(
+        Agreement.id == str(agreement_id),
+        Agreement.initiator_id == user.id
+    ).first()
+    
+    if not agreement:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agreement not found"
+        )
+    
+    # Check all parties have signed
+    unsigned = [p for p in agreement.parties if not p.signed]
+    if unsigned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Waiting for {len(unsigned)} signature(s)"
+        )
+    
+    agreement.status = "completed"
+    db.commit()
+    
+    return {"ok": True, "status": "completed", "message": "Agreement completed!"}

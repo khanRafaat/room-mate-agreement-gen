@@ -17,12 +17,17 @@ class Settings(BaseSettings):
     # Database (MySQL)
     database_url: str = "mysql+pymysql://root:@localhost:3306/roomate"
     
+    # JWT Authentication
+    jwt_secret_key: str = "your-super-secret-jwt-key-change-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
+    
     # Azure Storage
     azure_storage_connection_string: Optional[str] = None
     azure_storage_account_name: Optional[str] = None
     azure_storage_account_key: Optional[str] = None
     
-    # Azure AD B2C
+    # Azure AD B2C (optional, for enterprise SSO)
     azure_ad_b2c_tenant: Optional[str] = None
     azure_ad_b2c_client_id: Optional[str] = None
     azure_ad_b2c_policy: str = "B2C_1_signupsignin"
