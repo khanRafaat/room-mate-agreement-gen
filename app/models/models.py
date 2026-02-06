@@ -78,13 +78,89 @@ class FileAsset(Base):
     owner = relationship("AppUser", back_populates="file_assets")
 
 
+class Country(Base):
+    """Countries worldwide for agreement location selection."""
+    __tablename__ = "country"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    code = Column(String(3), unique=True, nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    states = relationship("State", back_populates="country", cascade="all, delete-orphan")
+
+
+class State(Base):
+    """States/Provinces/Divisions within a country."""
+    __tablename__ = "state"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    country_id = Column(String(36), ForeignKey("country.id", ondelete="CASCADE"), nullable=False)
+    code = Column(String(10), nullable=True)
+    name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    country = relationship("Country", back_populates="states")
+    cities = relationship("City", back_populates="state", cascade="all, delete-orphan")
+
+
+class City(Base):
+    """Cities within a state."""
+    __tablename__ = "city"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    state_id = Column(String(36), ForeignKey("state.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    state = relationship("State", back_populates="cities")
+    base_agreements = relationship("BaseAgreement", back_populates="city", cascade="all, delete-orphan")
+
+
+class BaseAgreement(Base):
+    """City-specific base agreement templates (20-30 pages)."""
+    __tablename__ = "base_agreement"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    city_id = Column(String(36), ForeignKey("city.id", ondelete="SET NULL"), nullable=True)  # Now nullable for custom cities
+    city_name = Column(String(100), nullable=True)  # Free-form city name when not using FK
+    title = Column(String(255), nullable=False)
+    version = Column(String(20), default="1.0.0")
+    content = Column(Text, nullable=True)  # Large text content for agreement
+    applicable_for = Column(String(50), default="both")  # 'landlord', 'tenant', 'both'
+    is_active = Column(Boolean, default=True)
+    effective_date = Column(Date, nullable=True)
+    
+    # PDF file storage (Azure Blob)
+    pdf_container = Column(String(100), nullable=True)  # Blob container name
+    pdf_blob_name = Column(String(500), nullable=True)  # Blob path
+    pdf_filename = Column(String(255), nullable=True)   # Original filename
+    pdf_size_bytes = Column(BigInteger, nullable=True)  # File size
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    city = relationship("City", back_populates="base_agreements")
+    agreements = relationship("Agreement", back_populates="base_agreement")
+
+
 class Agreement(Base):
     """Main agreement entity."""
     __tablename__ = "agreement"
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
     initiator_id = Column(String(36), ForeignKey("app_user.id"), nullable=False)
+    base_agreement_id = Column(String(36), ForeignKey("base_agreement.id"), nullable=True)
     title = Column(String(255), default="Roommate Agreement")
+    owner_name = Column(String(255), nullable=True)  # Landlord/Owner name
+    tenant_name = Column(String(255), nullable=True)  # Tenant name (auto-filled after acceptance)
     address_line1 = Column(String(255), nullable=True)
     address_line2 = Column(String(255), nullable=True)
     city = Column(String(100), nullable=True)
@@ -99,6 +175,7 @@ class Agreement(Base):
     
     # Relationships
     initiator = relationship("AppUser", back_populates="agreements")
+    base_agreement = relationship("BaseAgreement", back_populates="agreements")
     parties = relationship("AgreementParty", back_populates="agreement", cascade="all, delete-orphan")
     terms = relationship("AgreementTerms", back_populates="agreement", uselist=False, cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="agreement", cascade="all, delete-orphan")
@@ -120,6 +197,8 @@ class AgreementParty(Base):
     rent_share_cents = Column(Integer, nullable=True)
     utilities = Column(JSON, nullable=True)  # {"electricity": 50, "internet": 50, ...}
     chores = Column(JSON, nullable=True)
+    requires_id_verification = Column(Boolean, default=False)  # Owner wants tenant to verify
+    id_verified = Column(Boolean, default=False)  # Tenant has verified their ID
     signed = Column(Boolean, default=False)
     signed_at = Column(DateTime, nullable=True)
     

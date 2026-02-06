@@ -2,7 +2,7 @@
 Roommate Agreement Generator - Agreement Schemas
 Pydantic schemas for agreement-related request/response validation
 """
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import date, datetime
 from uuid import UUID
@@ -57,6 +57,7 @@ class AgreementPartyBase(BaseModel):
     rent_share_cents: Optional[int] = None
     utilities: Optional[Dict[str, Any]] = None
     chores: Optional[Dict[str, Any]] = None
+    requires_id_verification: bool = False  # Owner wants tenant to verify ID
 
 
 class AgreementPartyCreate(AgreementPartyBase):
@@ -68,6 +69,7 @@ class AgreementPartyResponse(AgreementPartyBase):
     """Schema for agreement party response."""
     id: UUID
     user_id: Optional[UUID] = None
+    id_verified: bool = False  # Tenant has verified their ID
     signed: bool
     signed_at: Optional[datetime] = None
     
@@ -87,22 +89,57 @@ class AgreementBase(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     rent_total_cents: int
+    
+    # Convert empty strings to None for date fields
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == '' or v is None:
+            return None
+        return v
+    
+    # Convert empty strings to None for optional string fields
+    @field_validator('address_line1', 'address_line2', 'city', 'state', 'postal_code', 'country', mode='before')
+    @classmethod
+    def empty_str_to_none(cls, v):
+        if v == '':
+            return None
+        return v
 
 
 class AgreementCreate(AgreementBase):
     """Schema for creating an agreement."""
+    base_agreement_id: Optional[str] = None  # Link to city-specific base agreement
+    owner_name: Optional[str] = None  # Landlord/Owner name
     terms: Optional[AgreementTermsCreate] = None
     parties: Optional[List[AgreementPartyCreate]] = None
+
+
+class BaseAgreementSummaryEmbed(BaseModel):
+    """Embedded base agreement summary in agreement response."""
+    id: str
+    title: str
+    version: str
+    city_name: Optional[str] = None
+    state_name: Optional[str] = None
+    country_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 
 class AgreementResponse(AgreementBase):
     """Schema for agreement response."""
     id: UUID
     initiator_id: UUID
+    base_agreement_id: Optional[str] = None
+    owner_name: Optional[str] = None
+    tenant_name: Optional[str] = None
     status: str
     created_at: datetime
     terms: Optional[AgreementTermsResponse] = None
     parties: List[AgreementPartyResponse] = []
+    base_agreement: Optional[BaseAgreementSummaryEmbed] = None
     
     class Config:
         from_attributes = True
@@ -111,6 +148,7 @@ class AgreementResponse(AgreementBase):
 class AgreementListResponse(BaseModel):
     """Schema for listing agreements."""
     id: UUID
+    initiator_id: UUID
     title: str
     address_line1: Optional[str] = None
     city: Optional[str] = None
@@ -127,6 +165,8 @@ class AgreementListResponse(BaseModel):
 class AgreementUpdate(BaseModel):
     """Schema for updating an agreement."""
     title: Optional[str] = None
+    base_agreement_id: Optional[str] = None
+    owner_name: Optional[str] = None
     address_line1: Optional[str] = None
     address_line2: Optional[str] = None
     city: Optional[str] = None
@@ -136,6 +176,23 @@ class AgreementUpdate(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     rent_total_cents: Optional[int] = None
+    
+    # Convert empty strings to None for date fields
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == '' or v is None:
+            return None
+        return v
+    
+    # Convert empty strings to None for optional string fields
+    @field_validator('title', 'base_agreement_id', 'owner_name', 'address_line1', 'address_line2', 
+                     'city', 'state', 'postal_code', 'country', mode='before')
+    @classmethod
+    def empty_str_to_none(cls, v):
+        if v == '':
+            return None
+        return v
 
 
 class InviteRequest(BaseModel):

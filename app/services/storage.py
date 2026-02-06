@@ -1,16 +1,12 @@
 """
 Roommate Agreement Generator - Storage Service
 Azure Blob Storage integration with SAS token generation
+Falls back to local storage in demo mode
 """
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
-from azure.storage.blob import (
-    BlobServiceClient,
-    generate_blob_sas,
-    BlobSasPermissions,
-    ContentSettings
-)
+from pathlib import Path
 
 from app.config import get_settings
 
@@ -18,33 +14,59 @@ settings = get_settings()
 
 
 class StorageService:
-    """Azure Blob Storage service for file management."""
+    """Storage service - uses Azure Blob Storage or Local Storage based on config."""
     
     # Container names
     CONTAINER_AGREEMENTS = "agreements"
     CONTAINER_IDS = "ids"
     CONTAINER_SIGNED = "signed"
+    CONTAINER_BASE_AGREEMENTS = "base-agreements"
     
     def __init__(self):
         """Initialize the storage service."""
-        self._client: Optional[BlobServiceClient] = None
+        self._azure_client = None
+        self._local_service = None
+        self._use_local = False
+        
+        # Check if we should use local storage
+        if settings.demo_mode or not settings.azure_storage_connection_string:
+            self._use_local = True
     
     @property
-    def client(self) -> BlobServiceClient:
-        """Get or create the BlobServiceClient."""
-        if self._client is None:
+    def is_local(self) -> bool:
+        """Check if using local storage."""
+        return self._use_local
+    
+    @property
+    def local_service(self):
+        """Get the local storage service."""
+        if self._local_service is None:
+            from app.services.local_storage import LocalStorageService
+            self._local_service = LocalStorageService()
+        return self._local_service
+    
+    @property
+    def azure_client(self):
+        """Get or create the Azure BlobServiceClient."""
+        if self._use_local:
+            raise ValueError("Using local storage, Azure client not available")
+        
+        if self._azure_client is None:
+            from azure.storage.blob import BlobServiceClient
             if settings.azure_storage_connection_string:
-                self._client = BlobServiceClient.from_connection_string(
+                self._azure_client = BlobServiceClient.from_connection_string(
                     settings.azure_storage_connection_string
                 )
             else:
                 raise ValueError("Azure Storage connection string not configured")
-        return self._client
+        return self._azure_client
     
     @property
     def account_name(self) -> str:
         """Get the storage account name."""
-        return settings.azure_storage_account_name or self.client.account_name
+        if self._use_local:
+            return "localhost"
+        return settings.azure_storage_account_name or self.azure_client.account_name
     
     def generate_upload_sas(
         self,
@@ -54,15 +76,12 @@ class StorageService:
     ) -> dict:
         """
         Generate a SAS token for uploading a blob.
-        
-        Args:
-            container: Container name
-            blob_name: Optional blob name (generated if not provided)
-            expiry_minutes: Token expiry in minutes
-            
-        Returns:
-            Dict with url, blob_name, and expires_at
         """
+        if self._use_local:
+            return self.local_service.generate_upload_sas(container, blob_name, expiry_minutes)
+        
+        from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+        
         if blob_name is None:
             blob_name = f"{uuid.uuid4()}"
         
@@ -93,15 +112,12 @@ class StorageService:
     ) -> dict:
         """
         Generate a SAS token for downloading a blob.
-        
-        Args:
-            container: Container name
-            blob_name: Blob name
-            expiry_minutes: Token expiry in minutes
-            
-        Returns:
-            Dict with url, blob_name, and expires_at
         """
+        if self._use_local:
+            return self.local_service.generate_download_sas(container, blob_name, expiry_minutes)
+        
+        from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+        
         expires_at = datetime.utcnow() + timedelta(minutes=expiry_minutes)
         
         token = generate_blob_sas(
@@ -130,17 +146,13 @@ class StorageService:
     ) -> str:
         """
         Upload data to a blob directly (server-side upload).
-        
-        Args:
-            container: Container name
-            blob_name: Blob name
-            data: Bytes to upload
-            content_type: Content type of the blob
-            
-        Returns:
-            Blob URL
         """
-        blob_client = self.client.get_blob_client(container=container, blob=blob_name)
+        if self._use_local:
+            return self.local_service.upload_blob(container, blob_name, data, content_type)
+        
+        from azure.storage.blob import ContentSettings
+        
+        blob_client = self.azure_client.get_blob_client(container=container, blob=blob_name)
         
         blob_client.upload_blob(
             data,
@@ -153,46 +165,35 @@ class StorageService:
     def download_blob(self, container: str, blob_name: str) -> bytes:
         """
         Download a blob's content.
-        
-        Args:
-            container: Container name
-            blob_name: Blob name
-            
-        Returns:
-            Blob content as bytes
         """
-        blob_client = self.client.get_blob_client(container=container, blob=blob_name)
+        if self._use_local:
+            return self.local_service.download_blob(container, blob_name)
+        
+        blob_client = self.azure_client.get_blob_client(container=container, blob=blob_name)
         return blob_client.download_blob().readall()
     
     def delete_blob(self, container: str, blob_name: str) -> bool:
         """
         Delete a blob.
-        
-        Args:
-            container: Container name
-            blob_name: Blob name
-            
-        Returns:
-            True if deleted successfully
         """
-        blob_client = self.client.get_blob_client(container=container, blob=blob_name)
+        if self._use_local:
+            return self.local_service.delete_blob(container, blob_name)
+        
+        blob_client = self.azure_client.get_blob_client(container=container, blob=blob_name)
         blob_client.delete_blob()
         return True
     
     def blob_exists(self, container: str, blob_name: str) -> bool:
         """
         Check if a blob exists.
-        
-        Args:
-            container: Container name
-            blob_name: Blob name
-            
-        Returns:
-            True if blob exists
         """
-        blob_client = self.client.get_blob_client(container=container, blob=blob_name)
+        if self._use_local:
+            return self.local_service.blob_exists(container, blob_name)
+        
+        blob_client = self.azure_client.get_blob_client(container=container, blob=blob_name)
         return blob_client.exists()
 
 
 # Singleton instance
 storage_service = StorageService()
+

@@ -45,3 +45,12 @@ class IdVerificationResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+
+class PersonaInquiryResponse(BaseModel):
+    """Schema for Persona embedded flow configuration."""
+    inquiry_id: Optional[str] = None
+    template_id: str
+    environment_id: str
+    reference_id: str
+

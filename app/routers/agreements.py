@@ -21,6 +21,8 @@ from app.schemas.payment import CheckoutLinks, CheckoutResponse
 from app.schemas.feedback import InviteTokenResponse
 from app.services.payments import payments_service
 from app.services.notify import notification_service
+from app.services.mail import mail_service
+import logging
 from app.services.docusign import docusign_service
 from app.config import get_settings
 
@@ -30,6 +32,10 @@ settings = get_settings()
 
 def require_verified_user(user: AppUser):
     """Check that user is ID verified, raise exception if not."""
+    # Skip verification check in demo mode
+    if settings.demo_mode:
+        return
+    
     if not user.is_verified:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -59,6 +65,8 @@ async def create_agreement(
     agreement = Agreement(
         initiator_id=user.id,
         title=body.title,
+        base_agreement_id=body.base_agreement_id,  # Link to city base agreement
+        owner_name=body.owner_name,  # Landlord name
         address_line1=body.address_line1,
         address_line2=body.address_line2,
         city=body.city,
@@ -336,6 +344,66 @@ async def initiate_payment(
     return CheckoutLinks(card=card_checkout, crypto=crypto_checkout)
 
 
+@router.post("/{agreement_id}/demo-pay")
+async def demo_payment(
+    agreement_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Simulate a successful payment (DEMO MODE ONLY).
+    
+    This endpoint is only available when DEMO_MODE is enabled.
+    It skips actual payment processing and marks the agreement as paid.
+    """
+    # Check demo mode
+    if not settings.demo_mode:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Demo payment is only available in demo mode"
+        )
+    
+    user = current_user.user
+    
+    agreement = db.query(Agreement).filter(
+        Agreement.id == str(agreement_id),
+        Agreement.initiator_id == user.id
+    ).first()
+    
+    if not agreement:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agreement not found"
+        )
+    
+    if agreement.status not in ["draft", "awaiting_payment"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot process payment for agreement in '{agreement.status}' status"
+        )
+    
+    # Create a demo payment record
+    demo_payment = Payment(
+        agreement_id=agreement.id,
+        method="demo",
+        amount_cents=0,  # Free in demo mode
+        status="succeeded",
+        provider_ref=f"demo_{agreement.id}"
+    )
+    db.add(demo_payment)
+    
+    # Update agreement status to paid
+    agreement.status = "paid"
+    db.commit()
+    
+    return {
+        "ok": True,
+        "message": "Payment simulated successfully",
+        "agreement_id": str(agreement.id),
+        "status": "paid"
+    }
+
+
 @router.post("/{agreement_id}/invite", response_model=List[InviteTokenResponse])
 async def invite_roommates(
     agreement_id: UUID,
@@ -364,21 +432,25 @@ async def invite_roommates(
             detail="Agreement not found"
         )
     
-    # Check payment status - must be paid
+    # Check payment status - must be paid (skip in demo mode)
     if agreement.status not in ["paid", "inviting"]:
-        successful_payment = db.query(Payment).filter(
-            Payment.agreement_id == agreement.id,
-            Payment.status == "succeeded"
-        ).first()
-        
-        if not successful_payment:
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail="Payment required before inviting roommates"
-            )
-        
-        # Update status to paid
-        agreement.status = "paid"
+        # In demo mode, allow inviting without payment
+        if settings.demo_mode:
+            agreement.status = "paid"
+        else:
+            successful_payment = db.query(Payment).filter(
+                Payment.agreement_id == agreement.id,
+                Payment.status == "succeeded"
+            ).first()
+            
+            if not successful_payment:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail="Payment required before inviting roommates"
+                )
+            
+            # Update status to paid
+            agreement.status = "paid"
     
     # Generate invites
     invite_responses = []
@@ -421,9 +493,13 @@ async def invite_roommates(
                     phone=roommate.phone,
                     rent_share_cents=roommate.rent_share_cents,
                     utilities=roommate.utilities,
-                    chores=roommate.chores
+                    chores=roommate.chores,
+                    requires_id_verification=roommate.requires_id_verification
                 )
                 db.add(party)
+            else:
+                # Update existing party with verification requirement
+                party.requires_id_verification = roommate.requires_id_verification
             
             # Create invite token
             invite_token = InviteToken(
@@ -434,18 +510,20 @@ async def invite_roommates(
             db.add(invite_token)
             db.flush()
         
-        invite_url = f"{settings.frontend_url}/invites/accept/{invite_token.token}"
+        invite_url = f"{settings.frontend_url}/invite/{invite_token.token}"
         
-        # Send invite email
+        # Send invite email via SMTP
         try:
-            notification_service.send_invite_email(
+            result = mail_service.send_invite_email(
                 to_email=roommate.email,
                 inviter_name=user.name or user.email,
                 agreement_title=agreement.title,
                 invite_link=invite_url
             )
-        except Exception:
-            pass  # Email not configured
+            if not result.get("success"):
+                logging.warning(f"Failed to send invite email to {roommate.email}: {result.get('error')}")
+        except Exception as e:
+            logging.error(f"Error sending invite email to {roommate.email}: {e}")
         
         invite_responses.append(InviteTokenResponse(
             token=invite_token.token,

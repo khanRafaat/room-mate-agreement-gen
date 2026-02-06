@@ -211,3 +211,102 @@ async def delete_file(
     db.commit()
     
     return None
+
+
+# ==================== LOCAL FILE ENDPOINTS (Demo Mode) ====================
+
+from fastapi import UploadFile, File
+from fastapi.responses import FileResponse
+from pathlib import Path
+
+
+@router.put("/local-upload/{container}/{blob_name:path}")
+async def local_upload_file(
+    container: str,
+    blob_name: str,
+    file: UploadFile = File(...)
+):
+    """
+    Direct file upload endpoint for local storage (demo mode).
+    
+    This endpoint is used when Azure storage is not configured.
+    The frontend should upload files directly to this endpoint.
+    """
+    if not storage_service.is_local:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local upload not available - Azure storage is configured"
+        )
+    
+    # Read file content
+    content = await file.read()
+    
+    # Upload to local storage
+    storage_service.upload_blob(
+        container=container,
+        blob_name=blob_name,
+        data=content,
+        content_type=file.content_type or "application/octet-stream"
+    )
+    
+    return {"success": True, "blob_name": blob_name, "size_bytes": len(content)}
+
+
+@router.post("/local-upload/{container}/{blob_name:path}")
+async def local_upload_file_post(
+    container: str,
+    blob_name: str,
+    file: UploadFile = File(...)
+):
+    """
+    Direct file upload endpoint (POST variant) for local storage.
+    """
+    return await local_upload_file(container, blob_name, file)
+
+
+@router.get("/local-download/{container}/{blob_name:path}")
+async def local_download_file(
+    container: str,
+    blob_name: str
+):
+    """
+    Direct file download endpoint for local storage (demo mode).
+    
+    Returns the file for download.
+    """
+    if not storage_service.is_local:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local download not available - Azure storage is configured"
+        )
+    
+    # Get the file path
+    from app.services.local_storage import local_storage_service
+    file_path = local_storage_service.get_blob_path(container, blob_name)
+    
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found"
+        )
+    
+    # Determine content type based on extension
+    content_type_map = {
+        ".pdf": "application/pdf",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+    }
+    
+    suffix = file_path.suffix.lower()
+    content_type = content_type_map.get(suffix, "application/octet-stream")
+    
+    return FileResponse(
+        path=str(file_path),
+        media_type=content_type,
+        filename=file_path.name
+    )
+

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.database import init_db
-from app.routers import agreements, webhooks, files, users, auth, feedback, invites
+from app.routers import agreements, webhooks, files, users, auth, feedback, invites, locations, base_agreements
 from app.config import get_settings
 
 settings = get_settings()
@@ -81,6 +81,8 @@ app.include_router(feedback.router, prefix="/api")  # Roommate ratings
 app.include_router(webhooks.router, prefix="/api")
 app.include_router(files.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
+app.include_router(locations.router, prefix="/api")  # Country/State/City dropdowns
+app.include_router(base_agreements.router, prefix="/api")  # Base agreement templates
 
 
 @app.get("/")

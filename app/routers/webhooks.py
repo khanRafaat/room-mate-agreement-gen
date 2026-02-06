@@ -238,6 +238,8 @@ async def kyc_webhook(
 ):
     """
     Handle KYC provider webhook events.
+    
+    For Persona: expects X-Persona-Signature header
     """
     from app.models.models import IdVerification
     from app.services.kyc import kyc_service
@@ -248,6 +250,9 @@ async def kyc_webhook(
             detail="Unknown KYC provider"
         )
     
+    # Get raw body for signature verification
+    body = await request.body()
+    
     try:
         payload = await request.json()
     except Exception:
@@ -256,7 +261,17 @@ async def kyc_webhook(
             detail="Invalid JSON payload"
         )
     
-    signature = request.headers.get("X-Webhook-Signature")
+    # Get appropriate signature header based on provider
+    if provider == "persona":
+        signature = request.headers.get("X-Persona-Signature")
+        # Verify Persona webhook signature
+        if signature and not kyc_service.verify_persona_webhook(body, signature):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid webhook signature"
+            )
+    else:
+        signature = request.headers.get("X-Webhook-Signature")
     
     try:
         result = kyc_service.process_webhook(provider, payload, signature)
@@ -267,16 +282,44 @@ async def kyc_webhook(
         )
     
     # Update verification record
-    verification = db.query(IdVerification).filter(
-        IdVerification.reference_id == result.get("verification_id"),
-        IdVerification.provider == provider
-    ).first()
+    # For Persona: use reference_id (our user_id) to find the verification
+    # since inquiry_id may not be stored when SDK creates inquiry on load
+    if provider == "persona":
+        user_id = result.get("reference_id")  # This is our user.id
+        inquiry_id = result.get("verification_id")  # This is the Persona inquiry_id
+        
+        # Find the most recent pending Persona verification for this user
+        verification = db.query(IdVerification).filter(
+            IdVerification.user_id == user_id,
+            IdVerification.provider == "persona",
+            IdVerification.status == "pending"
+        ).first()
+        
+        # If not found by user_id, try by inquiry_id (in case it was already set)
+        if not verification and inquiry_id:
+            verification = db.query(IdVerification).filter(
+                IdVerification.reference_id == inquiry_id,
+                IdVerification.provider == "persona"
+            ).first()
+    else:
+        # Other providers: look up by reference_id
+        verification = db.query(IdVerification).filter(
+            IdVerification.reference_id == result.get("verification_id"),
+            IdVerification.provider == provider
+        ).first()
     
     if verification:
+        # Update the inquiry_id reference if it was missing
+        if provider == "persona" and result.get("verification_id"):
+            verification.reference_id = result.get("verification_id")
+        
         verification.status = result.get("status", "pending")
         if result.get("completed_at"):
             from datetime import datetime
-            verification.completed_at = datetime.fromisoformat(result["completed_at"])
+            try:
+                verification.completed_at = datetime.fromisoformat(result["completed_at"].replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                verification.completed_at = datetime.utcnow()
         
         # Update user verification status if approved
         if verification.status == "approved":

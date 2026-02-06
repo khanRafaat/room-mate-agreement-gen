@@ -24,11 +24,12 @@ def upgrade() -> None:
     # ==========================================
     # app_user - User accounts
     # ==========================================
+    
     op.create_table(
         'app_user',
         sa.Column('id', sa.String(36), primary_key=True),
-        sa.Column('b2c_sub', sa.String(255), unique=True, nullable=False, index=True),
-        sa.Column('email', sa.String(255), nullable=False),
+        sa.Column('b2c_sub', sa.String(191), unique=True, nullable=False, index=True),
+        sa.Column('email', sa.String(191), nullable=False),
         sa.Column('phone', sa.String(50), nullable=True),
         sa.Column('is_verified', sa.Boolean(), default=False),
         sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
@@ -97,7 +98,7 @@ def upgrade() -> None:
         sa.Column('agreement_id', sa.String(36), sa.ForeignKey('agreement.id', ondelete='CASCADE'), nullable=False),
         sa.Column('user_id', sa.String(36), sa.ForeignKey('app_user.id'), nullable=True),
         sa.Column('role', sa.String(50), nullable=False),
-        sa.Column('email', sa.String(255), nullable=False),
+        sa.Column('email', sa.String(191), nullable=False),
         sa.Column('phone', sa.String(50), nullable=True),
         sa.Column('rent_share_cents', sa.Integer(), nullable=True),
         sa.Column('utilities', sa.JSON(), nullable=True),

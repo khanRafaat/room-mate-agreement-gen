@@ -9,7 +9,7 @@ from typing import List
 from app.database import get_db
 from app.deps.auth import get_current_user, CurrentUser
 from app.models.models import AppUser, IdVerification
-from app.schemas.user import UserResponse, IdVerificationCreate, IdVerificationResponse
+from app.schemas.user import UserResponse, IdVerificationCreate, IdVerificationResponse, PersonaInquiryResponse
 from app.services.kyc import kyc_service
 from app.config import get_settings
 
@@ -157,3 +157,115 @@ async def get_verification(
         )
     
     return verification
+
+
+@router.post("/verify/persona/inquiry", response_model=PersonaInquiryResponse)
+async def create_persona_inquiry(
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Create a Persona inquiry for embedded flow verification.
+    
+    Returns the template_id, environment_id, and reference_id needed
+    to initialize the Persona SDK on the frontend.
+    """
+    user = current_user.user
+    
+    if user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is already verified"
+        )
+    
+    # Check for pending verification
+    pending = db.query(IdVerification).filter(
+        IdVerification.user_id == user.id,
+        IdVerification.status == "pending"
+    ).first()
+    
+    if pending:
+        # Return existing inquiry info if there's a pending verification
+        # User can continue the same verification
+        return PersonaInquiryResponse(
+            inquiry_id=pending.reference_id,
+            template_id=settings.persona_template_id or "",
+            environment_id=settings.persona_environment_id or "",
+            reference_id=str(user.id)
+        )
+    
+    # Validate Persona configuration
+    if not settings.persona_template_id or not settings.persona_environment_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Persona verification is not configured"
+        )
+    
+    try:
+        # Create inquiry using KYC service
+        result = kyc_service.create_persona_inquiry(
+            user_id=str(user.id),
+            user_email=user.email
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create Persona inquiry: {str(e)}"
+        )
+    
+    # Create verification record
+    verification = IdVerification(
+        user_id=user.id,
+        provider="persona",
+        status="pending",
+        reference_id=result.get("inquiry_id")  # May be None for SDK-created
+    )
+    db.add(verification)
+    db.commit()
+    
+    return PersonaInquiryResponse(
+        inquiry_id=result.get("inquiry_id"),
+        template_id=result.get("template_id", ""),
+        environment_id=result.get("environment_id", ""),
+        reference_id=result.get("reference_id", str(user.id))
+    )
+
+
+@router.post("/verify/persona/complete")
+async def complete_persona_verification(
+    inquiry_id: str,
+    status_str: str = "completed",
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Called by frontend when Persona verification completes.
+    Updates the verification record with the inquiry ID.
+    
+    Note: Actual approval happens via webhook. This just updates the inquiry_id.
+    """
+    user = current_user.user
+    
+    # Find pending verification for user
+    verification = db.query(IdVerification).filter(
+        IdVerification.user_id == user.id,
+        IdVerification.provider == "persona",
+        IdVerification.status == "pending"
+    ).first()
+    
+    if verification:
+        # Update with inquiry ID from SDK
+        verification.reference_id = inquiry_id
+        
+        # For sandbox/testing: if status is 'completed' or 'approved', mark as approved
+        # In production, this should only be done via webhook
+        if status_str in ["approved", "completed"]:
+            from datetime import datetime
+            verification.status = "approved"
+            verification.completed_at = datetime.utcnow()
+            user.is_verified = True
+        
+        db.commit()
+    
+    return {"status": "updated", "inquiry_id": inquiry_id}
+

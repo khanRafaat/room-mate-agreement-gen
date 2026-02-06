@@ -56,6 +56,15 @@ async def get_invite_info(
             detail="Agreement not found"
         )
     
+    # Get the initiator (owner) info
+    initiator = db.query(AppUser).filter(AppUser.id == agreement.initiator_id).first()
+    
+    # Get the party record to check verification requirement
+    party = db.query(AgreementParty).filter(
+        AgreementParty.agreement_id == agreement.id,
+        AgreementParty.email == invite.email
+    ).first()
+    
     # Check if user with this email exists and is verified
     existing_user = db.query(AppUser).filter(AppUser.email == invite.email).first()
     
@@ -64,6 +73,11 @@ async def get_invite_info(
         "email": invite.email,
         "agreement_id": agreement.id,
         "agreement_title": agreement.title,
+        "agreement_city": agreement.city,
+        "agreement_state": agreement.state,
+        "owner_name": initiator.name or initiator.email if initiator else None,
+        "requires_id_verification": party.requires_id_verification if party else False,
+        "rent_share_cents": party.rent_share_cents if party else None,
         "expires_at": invite.expires_at,
         "user_exists": existing_user is not None,
         "user_verified": existing_user.is_verified if existing_user else False,
@@ -85,17 +99,13 @@ async def accept_invite(
     Accept an invite and join the agreement.
     
     - User must be logged in
-    - User must be verified (ID.me)
+    - User must be verified (ID.me) - unless in demo mode
     - Token must be valid and not expired
     """
     user = current_user.user
     
-    # Check user is verified
-    if not user.is_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You must complete ID verification before joining an agreement"
-        )
+    # Note: Verification is checked per-party based on requires_id_verification
+    # This allows tenants to accept invites without verification when owner doesn't require it
     
     invite = db.query(InviteToken).filter(InviteToken.token == token).first()
     
@@ -138,6 +148,18 @@ async def accept_invite(
     ).first()
     
     if party:
+        # Check if ID verification is required for this party
+        if party.requires_id_verification and not party.id_verified:
+            # In demo mode, auto-verify; in production, require actual verification
+            if settings.demo_mode:
+                party.id_verified = True
+            else:
+                if not user.is_verified:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="This agreement requires ID verification. Please complete verification first."
+                    )
+                party.id_verified = True
         party.user_id = user.id
     else:
         # Create new party
