@@ -307,6 +307,5 @@ async def local_download_file(
     return FileResponse(
         path=str(file_path),
         media_type=content_type,
-        filename=file_path.name
     )
 

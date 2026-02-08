@@ -171,6 +171,7 @@ class Agreement(Base):
     end_date = Column(Date, nullable=True)
     rent_total_cents = Column(Integer, nullable=False)
     status = Column(String(50), default="draft")  # 'draft', 'awaiting_payment', 'paid', 'inviting', 'signing', 'completed', 'void'
+    content = Column(Text, nullable=True)  # Written agreement text (owner to tenant)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships

@@ -734,7 +734,6 @@ async def serve_pdf(
             return FileResponse(
                 str(local_path),
                 media_type="application/pdf",
-                filename=base_agreement.pdf_filename or "agreement.pdf"
             )
     
     # Fall back to redirect to signed URL

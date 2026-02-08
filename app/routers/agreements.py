@@ -67,6 +67,7 @@ async def create_agreement(
         title=body.title,
         base_agreement_id=body.base_agreement_id,  # Link to city base agreement
         owner_name=body.owner_name,  # Landlord name
+        content=body.content,  # Written agreement text (owner to tenant)
         address_line1=body.address_line1,
         address_line2=body.address_line2,
         city=body.city,
@@ -132,13 +133,15 @@ async def list_agreements(
 ):
     """
     List all agreements for the current user.
+    Includes agreements where user is initiator, a linked party, or invited by email.
     """
     user = current_user.user
     
-    # Get agreements where user is initiator or a party
+    # Get agreements where user is initiator or a party (by user_id or email)
     agreements = db.query(Agreement).filter(
         (Agreement.initiator_id == user.id) |
-        (Agreement.parties.any(AgreementParty.user_id == user.id))
+        (Agreement.parties.any(AgreementParty.user_id == user.id)) |
+        (Agreement.parties.any(AgreementParty.email == user.email))
     ).order_by(Agreement.created_at.desc()).all()
     
     return agreements
@@ -153,12 +156,11 @@ async def get_agreement(
     """
     Get a specific agreement by ID.
     
-    **Requires**: User must be ID verified to view agreement details.
+    Verification is only enforced based on the party's requirements:
+    - Agreement initiators must always be verified
+    - Invited tenants only need verification if the owner required it for them
     """
     user = current_user.user
-    
-    # Enforce ID verification for viewing
-    require_verified_user(user)
     
     agreement = db.query(Agreement).filter(Agreement.id == str(agreement_id)).first()
     
@@ -168,12 +170,29 @@ async def get_agreement(
             detail="Agreement not found"
         )
     
-    # Check user has access (is initiator or a party)
-    is_party = any(p.user_id == user.id or p.email == user.email for p in agreement.parties)
-    if agreement.initiator_id != user.id and not is_party:
+    # Check user has access (is initiator or a party by user_id or email)
+    is_initiator = agreement.initiator_id == user.id
+    party_record = next(
+        (p for p in agreement.parties if p.user_id == user.id or p.email == user.email),
+        None
+    )
+    is_party = party_record is not None
+    
+    if not is_initiator and not is_party:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You don't have access to this agreement"
+        )
+    
+    # Enforce verification based on role:
+    # - Initiator always requires verification
+    # - Party members only if requires_id_verification is set for them
+    if is_initiator:
+        require_verified_user(user)
+    elif is_party and party_record.requires_id_verification and not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This agreement requires ID verification. Please verify your identity first."
         )
     
     return agreement
@@ -342,6 +361,89 @@ async def initiate_payment(
     db.commit()
     
     return CheckoutLinks(card=card_checkout, crypto=crypto_checkout)
+
+
+@router.post("/{agreement_id}/confirm-payment")
+async def confirm_payment(
+    agreement_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Confirm payment status by checking Stripe directly.
+    
+    This endpoint serves as a webhook fallback — it checks Stripe
+    for the actual payment status and updates the agreement accordingly.
+    Useful when webhooks can't reach the server (e.g., local development).
+    """
+    user = current_user.user
+    require_verified_user(user)
+    
+    agreement = db.query(Agreement).filter(
+        Agreement.id == str(agreement_id),
+        Agreement.initiator_id == user.id
+    ).first()
+    
+    if not agreement:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agreement not found"
+        )
+    
+    # Already paid? Return success immediately
+    if agreement.status in ["paid", "inviting", "signing", "completed"]:
+        return {
+            "ok": True,
+            "status": agreement.status,
+            "message": "Payment already confirmed"
+        }
+    
+    if agreement.status != "awaiting_payment":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Agreement is in '{agreement.status}' status, not awaiting payment"
+        )
+    
+    # Find pending payment record
+    payment = db.query(Payment).filter(
+        Payment.agreement_id == agreement.id,
+        Payment.status == "pending"
+    ).order_by(Payment.created_at.desc()).first()
+    
+    if not payment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No pending payment found for this agreement"
+        )
+    
+    # Check Stripe session status
+    try:
+        session = payments_service.get_stripe_session(payment.provider_ref)
+        
+        if session.payment_status == "paid":
+            # Payment confirmed! Update records
+            payment.status = "succeeded"
+            agreement.status = "paid"
+            db.commit()
+            
+            return {
+                "ok": True,
+                "status": "paid",
+                "message": "Payment confirmed successfully"
+            }
+        else:
+            return {
+                "ok": False,
+                "status": agreement.status,
+                "payment_status": session.payment_status,
+                "message": "Payment not yet completed"
+            }
+    except Exception as e:
+        logging.error(f"Error checking Stripe session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to verify payment status: {str(e)}"
+        )
 
 
 @router.post("/{agreement_id}/demo-pay")

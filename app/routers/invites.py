@@ -206,11 +206,21 @@ async def get_my_pending_invites(
         agreement = db.query(Agreement).filter(Agreement.id == invite.agreement_id).first()
         initiator = db.query(AppUser).filter(AppUser.id == agreement.initiator_id).first() if agreement else None
         
+        # Get the party record for this invite to check verification requirement
+        party = db.query(AgreementParty).filter(
+            AgreementParty.agreement_id == invite.agreement_id,
+            AgreementParty.email == invite.email
+        ).first()
+        
         result.append({
             "token": invite.token,
             "agreement_id": invite.agreement_id,
             "agreement_title": agreement.title if agreement else None,
             "invited_by": initiator.name or initiator.email if initiator else None,
+            "agreement_city": agreement.city if agreement else None,
+            "agreement_state": agreement.state if agreement else None,
+            "requires_id_verification": party.requires_id_verification if party else False,
+            "rent_share_cents": party.rent_share_cents if party else None,
             "expires_at": invite.expires_at
         })
     

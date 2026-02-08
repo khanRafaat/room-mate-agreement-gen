@@ -89,6 +89,7 @@ class AgreementBase(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     rent_total_cents: int
+    content: Optional[str] = None  # Written agreement text
     
     # Convert empty strings to None for date fields
     @field_validator('start_date', 'end_date', mode='before')
@@ -136,6 +137,7 @@ class AgreementResponse(AgreementBase):
     owner_name: Optional[str] = None
     tenant_name: Optional[str] = None
     status: str
+    content: Optional[str] = None
     created_at: datetime
     terms: Optional[AgreementTermsResponse] = None
     parties: List[AgreementPartyResponse] = []
@@ -176,6 +178,7 @@ class AgreementUpdate(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     rent_total_cents: Optional[int] = None
+    content: Optional[str] = None
     
     # Convert empty strings to None for date fields
     @field_validator('start_date', 'end_date', mode='before')

@@ -57,8 +57,8 @@ class PaymentsService:
                 },
                 "quantity": 1
             }],
-            success_url=success_url or f"{base_url}/agreements/{agreement_id}?paid=1",
-            cancel_url=cancel_url or f"{base_url}/agreements/{agreement_id}?canceled=1",
+            success_url=success_url or f"{base_url}/agreements/create-flow?paid=1&agreement_id={agreement_id}",
+            cancel_url=cancel_url or f"{base_url}/agreements/create-flow?canceled=1&agreement_id={agreement_id}",
             metadata={"agreement_id": agreement_id}
         )
         
